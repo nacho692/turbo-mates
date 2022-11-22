@@ -7,14 +7,26 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"sync"
 )
 
+// TODO:
+// Split messages and their handlers, maybe register them in a centralized map
+// Make a request-response validation in order to avoid mixing up messages
 const (
 	addrBytes = 8
+	// alpha indicates how many neighbours to share on a lookup message
+	alpha = 3
 	// k is the max size of each kademlia bucket, we are unbounded atm as we
 	// are not using it
 	k = 5
+)
+
+// Message types
+const (
+	lookup  = "lookup"
+	friends = "friends"
 )
 
 // distance addressability must be addrBytes * 8
@@ -42,28 +54,54 @@ func (u ID) distance(v ID) distance {
 }
 
 type Discovery struct {
-	Port  int
-	Debug bool
-	ID    ID
+	Name      string
+	Port      int
+	Debug     bool
+	ID        ID
+	Bootstrap *net.UDPAddr
 
-	mu      sync.Mutex
-	buckets [addrBytes * 8][]*Peer
+	mu      sync.RWMutex
+	buckets [addrBytes * 8][]*peer
+	socket  *net.UDPConn
 }
 
-type Peer struct {
+type peer struct {
 	ID   ID
-	Addr net.Addr
+	Addr *net.UDPAddr
+	conn *net.UDPConn
+}
+
+func (p *peer) send(m *message) {
+	b, _ := json.Marshal(&m)
+	_, err := p.conn.WriteToUDP(b, p.Addr)
+	if err != nil {
+		fmt.Printf("[Discovery] Sending UDP: %v\n", err)
+	}
 }
 
 type message struct {
-	ID      ID              `json:"ID"`
+	Sender  ID              `json:"sender"`
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
 
+type lookupPayload struct {
+	ID ID
+}
+
+type friendsPayload struct {
+	Friends []*peer
+}
+
 // Start starts the peer discovery, can be stopped by canceling the context.
 func (d *Discovery) Start(ctx context.Context) error {
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{
+
+	if d.Name == "" {
+		d.Name = "Discovery"
+	}
+
+	var err error
+	d.socket, err = net.ListenUDP("udp", &net.UDPAddr{
 		IP:   nil,
 		Port: d.Port,
 		Zone: "",
@@ -71,16 +109,32 @@ func (d *Discovery) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	defer d.socket.Close()
+
+	if d.Bootstrap != nil {
+		payload, _ := json.Marshal(&lookupPayload{
+			ID: d.ID,
+		})
+		m, _ := json.Marshal(&message{
+			Sender:  d.ID,
+			Type:    lookup,
+			Payload: payload,
+		})
+		_, err = d.socket.WriteToUDP(m, d.Bootstrap)
+		if err != nil && d.Debug {
+			fmt.Printf("[%s] Bootstrap lookup send: %v\n", d.Name, err)
+		}
+	}
 	read := make([]byte, 2048)
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		n, addr, err := ln.ReadFromUDP(read)
+		n, addr, err := d.socket.ReadFromUDP(read)
 		if err != nil {
 			if d.Debug {
-				fmt.Printf("[Discovery] Reading UDP: %v\n", err)
+				fmt.Printf("[%s] Reading UDP: %v\n", d.Name, err)
 			}
 			continue
 		}
@@ -99,35 +153,77 @@ func (d *Discovery) readMessage(data *bytes.Buffer, addr *net.UDPAddr) {
 			fmt.Printf("[Discovery] Decoding metadata: %v\n", err)
 		}
 	}
-	switch m.Type {
-	case "Hi!":
-		d.handleHi(m, addr)
-	case "Ho!":
-		//d.handleHo(data, addr)
-	}
-}
-
-func (d *Discovery) handleHi(m *message, addr *net.UDPAddr) {
-	d.addOrRefresh(&Peer{
-		ID:   m.ID,
+	p := &peer{
+		ID:   m.Sender,
 		Addr: addr,
-	})
-	// should return Ho!
+		conn: d.socket,
+	}
+	switch m.Type {
+	case lookup:
+		d.handleLookup(p, m)
+	case friends:
+		d.handleFriends(p, m)
+	}
 }
 
-func (d *Discovery) addOrRefresh(peer *Peer) {
-	higherEnd := distance(1) << (addrBytes*8 - 1)
-	dist := peer.ID.distance(d.ID)
-	if dist == 0 {
-		// ourselves?
-		return
+func (d *Discovery) handleLookup(p *peer, m *message) {
+	payload := &lookupPayload{}
+	err := json.Unmarshal(m.Payload, payload)
+	if err != nil {
+		if d.Debug {
+			fmt.Printf("[Discovery] Decoding lookup payload: %v\n", err)
+		}
 	}
-	idx := addrBytes*8 - 1
-	// we count the amount of 1s until the first 0, that's our bucket
-	for higherEnd&dist > 0 {
-		higherEnd >>= 1
-		idx--
+
+	d.addOrRefresh(p)
+
+	d.mu.RLock()
+	var peers []*peer
+	for _, b := range d.buckets {
+		peers = append(peers, b...)
 	}
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].ID.distance(payload.ID) <= peers[i].ID.distance(payload.ID)
+	})
+
+	pLen := 0
+	if len(peers) <= k {
+		pLen = len(peers)
+	}
+	response, err := json.Marshal(&friendsPayload{
+		Friends: peers[:pLen],
+	})
+	d.mu.RUnlock()
+	if err != nil {
+		if d.Debug {
+			fmt.Printf("[Discovery] Encoding friends payload: %v\n", err)
+		}
+	}
+	p.send(&message{
+		Sender:  d.ID,
+		Type:    friends,
+		Payload: response,
+	})
+}
+
+func (d *Discovery) handleFriends(p *peer, m *message) {
+	payload := &friendsPayload{}
+	err := json.Unmarshal(m.Payload, payload)
+	if err != nil {
+		if d.Debug {
+			fmt.Printf("[Discovery] Decoding friends payload: %v\n", err)
+		}
+	}
+
+	d.addOrRefresh(p)
+	for _, f := range payload.Friends {
+		d.addOrRefresh(f)
+	}
+}
+
+func (d *Discovery) addOrRefresh(peer *peer) {
+	idx := distanceToBucket(peer.ID.distance(d.ID))
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, p := range d.buckets[idx] {
@@ -139,17 +235,17 @@ func (d *Discovery) addOrRefresh(peer *Peer) {
 	d.buckets[idx] = append(d.buckets[idx], peer)
 }
 
-func (d *Discovery) Send() {
-	udp, _ := net.DialUDP("udp", nil, &net.UDPAddr{
-		IP:   net.ParseIP("localhost"),
-		Port: d.Port,
-		Zone: "",
-	})
-	m := &message{
-		ID:      d.ID,
-		Type:    "Hi!",
-		Payload: nil,
+func distanceToBucket(d distance) uint {
+	higherEnd := distance(1) << (addrBytes*8 - 1)
+	if d == 0 {
+		// ourselves?
+		return 0
 	}
-
-	json.NewEncoder(udp).Encode(m)
+	idx := uint(addrBytes*8 - 1)
+	// we count the amount of 1s until the first 0, that's our bucket
+	for higherEnd&d > 0 {
+		higherEnd >>= 1
+		idx--
+	}
+	return idx
 }

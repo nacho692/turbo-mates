@@ -1,19 +1,36 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net"
+	"time"
+
 	"github.com/nacho692/turbo-mates/discovery"
-	"math/rand"
 )
 
 // main to test bucketing
 func main() {
-	rand.Seed(1)
-	for i := 0; i < 10; i++ {
-		d := discovery.Discovery{
-			Port:  7070,
+	var nodes []*discovery.Discovery
+	for i := 0; i < 3; i++ {
+		nodes = append(nodes, &discovery.Discovery{
+			Name:  fmt.Sprintf("%d", i),
+			Port:  7070 + i + 1,
 			Debug: true,
 			ID:    discovery.NewID(),
-		}
-		d.Send()
+			Bootstrap: &net.UDPAddr{
+				IP:   net.ParseIP("127.0.0.1"),
+				Port: 7070,
+			},
+		})
 	}
+
+	for _, n := range nodes {
+		n := n
+		go func() {
+			err := n.Start(context.Background())
+			fmt.Println(err)
+		}()
+	}
+	time.Sleep(10 * time.Hour)
 }
