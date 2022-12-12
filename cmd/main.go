@@ -16,7 +16,9 @@ func main() {
 
 	go func() {
 		err := d.Start(context.Background())
-		fmt.Println(err)
+		if err != nil {
+			fmt.Println(err)
+		}
 	}()
 
 	http.Handle("/", discovery.Handler(d))

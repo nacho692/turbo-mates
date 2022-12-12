@@ -12,7 +12,7 @@ import (
 // main to test bucketing
 func main() {
 	var nodes []*discovery.Discovery
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 30; i++ {
 		nodes = append(nodes, &discovery.Discovery{
 			Name:  fmt.Sprintf("%d", i),
 			Port:  7070 + i + 1,

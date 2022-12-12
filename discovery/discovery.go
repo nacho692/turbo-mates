@@ -53,6 +53,11 @@ func (u ID) distance(v ID) distance {
 	return dist
 }
 
+type receivedMessage struct {
+	data *bytes.Buffer
+	addr *net.UDPAddr
+}
+
 type Discovery struct {
 	Name      string
 	Port      int
@@ -63,20 +68,13 @@ type Discovery struct {
 	mu      sync.RWMutex
 	buckets [addrBytes * 8][]*peer
 	socket  *net.UDPConn
+
+	receivedMessages chan *receivedMessage
 }
 
 type peer struct {
 	ID   ID
 	Addr *net.UDPAddr
-	conn *net.UDPConn
-}
-
-func (p *peer) send(m *message) {
-	b, _ := json.Marshal(&m)
-	_, err := p.conn.WriteToUDP(b, p.Addr)
-	if err != nil {
-		fmt.Printf("[Discovery] Sending UDP: %v\n", err)
-	}
 }
 
 type message struct {
@@ -109,7 +107,10 @@ func (d *Discovery) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer d.socket.Close()
+
+	d.receivedMessages = make(chan *receivedMessage, 100)
+	shutdownReceiver := d.startReceiver(ctx)
+	shutdownConsumer := d.startConsumer(ctx)
 
 	if d.Bootstrap != nil {
 		payload, _ := json.Marshal(&lookupPayload{
@@ -125,47 +126,13 @@ func (d *Discovery) Start(ctx context.Context) error {
 			fmt.Printf("[%s] Bootstrap lookup send: %v\n", d.Name, err)
 		}
 	}
-	read := make([]byte, 2048)
-	for {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
 
-		n, addr, err := d.socket.ReadFromUDP(read)
-		if err != nil {
-			if d.Debug {
-				fmt.Printf("[%s] Reading UDP: %v\n", d.Name, err)
-			}
-			continue
-		}
-		dup := append([]byte(nil), read[:n]...)
-		go d.readMessage(bytes.NewBuffer(dup), addr)
-	}
-
+	<-ctx.Done()
+	d.socket.Close()
+	shutdownReceiver()
+	shutdownConsumer()
 	return nil
 }
-
-func (d *Discovery) readMessage(data *bytes.Buffer, addr *net.UDPAddr) {
-	m := &message{}
-	err := json.NewDecoder(data).Decode(m)
-	if err != nil {
-		if d.Debug {
-			fmt.Printf("[Discovery] Decoding metadata: %v\n", err)
-		}
-	}
-	p := &peer{
-		ID:   m.Sender,
-		Addr: addr,
-		conn: d.socket,
-	}
-	switch m.Type {
-	case lookup:
-		d.handleLookup(p, m)
-	case friends:
-		d.handleFriends(p, m)
-	}
-}
-
 func (d *Discovery) handleLookup(p *peer, m *message) {
 	payload := &lookupPayload{}
 	err := json.Unmarshal(m.Payload, payload)
@@ -199,11 +166,19 @@ func (d *Discovery) handleLookup(p *peer, m *message) {
 			fmt.Printf("[Discovery] Encoding friends payload: %v\n", err)
 		}
 	}
-	p.send(&message{
+	d.send(p, &message{
 		Sender:  d.ID,
 		Type:    friends,
 		Payload: response,
 	})
+}
+
+func (d *Discovery) send(peer *peer, m *message) {
+	b, _ := json.Marshal(&m)
+	_, err := d.socket.WriteToUDP(b, peer.Addr)
+	if err != nil {
+		fmt.Printf("[Discovery] Sending UDP: %v\n", err)
+	}
 }
 
 func (d *Discovery) handleFriends(p *peer, m *message) {
